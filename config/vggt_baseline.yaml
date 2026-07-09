@@ -1,0 +1,12 @@
+# CAPA config: VGGT Baseline (no adaptation, inference + alignment only)
+model_name: vggt
+ckpt_path: facebook/VGGT-1B
+
+tuning_mode: none
+n_steps: 0
+lr: 0.0
+max_bs_infer: null  # VGGT needs all frames in one pass for cross-frame attention
+
+alignment:
+  n_points: 12000
+  seed: 47

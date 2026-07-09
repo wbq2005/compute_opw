@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capa"
+version = "0.1.0"
+description = "Depth Completion As Parameter-efficient Adaptation"
+requires-python = ">=3.10"
+dependencies = [
+    "peft",
+    "omegaconf",
+    "matplotlib",
+    "numpy",
+    "pillow",
+    "colorlog",
+]
+
+[project.optional-dependencies]
+# torch/torchvision are installed separately per base-model env
+# (different CUDA builds, etc.), so they are not listed as hard deps.
+# Install them first, then `pip install -e .` to get the rest.
+torch = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+]
+
+[tool.setuptools.packages.find]
+include = ["capa*"]
+exclude = ["capa.base_models*"]
+
+[tool.ruff]
+line-length = 100

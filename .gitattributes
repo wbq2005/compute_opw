@@ -1,0 +1,2 @@
+assets/vpt_init_tokens/*.pt filter=lfs diff=lfs merge=lfs -text
+third_party/VGGT/examples/videos/kitchen.mp4 filter=lfs diff=lfs merge=lfs -text

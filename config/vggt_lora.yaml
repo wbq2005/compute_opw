@@ -1,0 +1,20 @@
+# CAPA config: VGGT + LoRA
+model_name: vggt
+ckpt_path: facebook/VGGT-1B
+
+tuning_mode: lora
+lora_rank: 4
+lora_alpha: 8
+lora_target_modules: ["qkv"]
+
+n_steps: 100
+lr: 1.0e-3
+lr_scheduler: null
+gradient_clip_norm: 1.0
+max_bs_optimize: 10
+max_bs_infer: null
+pct_random_key_frame: 10
+
+alignment:
+  n_points: 12000
+  seed: 47
