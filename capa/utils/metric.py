@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA Corporation. All rights reserved.
 # Licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)
+import math
 import os
 import sys
 from pathlib import Path
@@ -16,8 +17,9 @@ logger = get_local_logger(__name__)
 _GMFLOW_HELP = (
     "GMFlow is required for real OPW evaluation but could not be imported. "
     "Clone https://github.com/haofeixu/gmflow, set GMFLOW_REPO=/path/to/gmflow, "
-    "set PYTHONPATH=$GMFLOW_REPO:$PYTHONPATH, and pass "
-    "--gmflow-ckpt /path/to/gmflow_sintel-0c07dcb3.pth."
+    "or place the checkout at third_party/gmflow. Pass --gmflow-ckpt, set "
+    "GMFLOW_CKPT, or keep gmflow_sintel-0c07dcb3.pth under the GMFlow "
+    "pretrained/models directory."
 )
 
 
@@ -68,20 +70,82 @@ def _resolve_gmflow_repo(gmflow_repo: str | os.PathLike[str] | None = None) -> P
         candidates.append(Path(env_repo).expanduser())
 
     repo_root = Path(__file__).resolve().parents[2]
-    fallback = repo_root / "third_party" / "gmflow"
-    if fallback.exists():
-        candidates.append(fallback)
+    candidates.extend(
+        [
+            repo_root / "third_party" / "gmflow",
+            repo_root / "gmflow",
+            repo_root / "gmflow(1)" / "gmflow",
+        ]
+    )
 
     for candidate in candidates:
         candidate = candidate.resolve()
         if (candidate / "gmflow" / "gmflow.py").exists():
+            return candidate
+        if candidate.name == "gmflow" and (candidate / "gmflow.py").exists():
+            return candidate.parent
+
+    return None
+
+
+def _resolve_gmflow_ckpt(
+    ckpt_path: str | os.PathLike[str] | None,
+    gmflow_repo: Path | None,
+) -> Path | None:
+    """Resolve the GMFlow Sintel checkpoint from an explicit path, env, or repo."""
+    candidates: list[Path] = []
+
+    if ckpt_path is not None:
+        candidates.append(Path(ckpt_path).expanduser())
+
+    env_ckpt = os.environ.get("GMFLOW_CKPT")
+    if env_ckpt:
+        candidates.append(Path(env_ckpt).expanduser())
+
+    if gmflow_repo is not None:
+        candidates.extend(
+            [
+                gmflow_repo / "pretrained" / "models" / "gmflow_sintel-0c07dcb3.pth",
+                gmflow_repo / "pretrained" / "gmflow_sintel-0c07dcb3.pth",
+            ]
+        )
+        candidates.extend(
+            sorted((gmflow_repo / "pretrained" / "models").glob("gmflow_sintel-*.pth"))
+        )
+        candidates.extend(sorted((gmflow_repo / "pretrained").glob("gmflow_sintel-*.pth")))
+
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates.extend(
+        [
+            repo_root
+            / "gmflow(1)"
+            / "gmflow"
+            / "pretrained"
+            / "models"
+            / "gmflow_sintel-0c07dcb3.pth",
+            repo_root
+            / "third_party"
+            / "gmflow"
+            / "pretrained"
+            / "models"
+            / "gmflow_sintel-0c07dcb3.pth",
+        ]
+    )
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
             return candidate
 
     return None
 
 
 def load_gmflow(
-    ckpt_path: str | os.PathLike[str],
+    ckpt_path: str | os.PathLike[str] | None,
     device: torch.device | str,
     gmflow_repo: str | os.PathLike[str] | None = None,
 ) -> torch.nn.Module:
@@ -107,11 +171,13 @@ def load_gmflow(
     except Exception as exc:  # pragma: no cover - depends on external GMFlow
         raise ImportError(_GMFLOW_HELP) from exc
 
-    ckpt = Path(ckpt_path).expanduser()
-    if not ckpt.is_file():
+    ckpt = _resolve_gmflow_ckpt(ckpt_path, resolved_repo)
+    if ckpt is None:
+        requested = Path(ckpt_path).expanduser() if ckpt_path is not None else None
         raise FileNotFoundError(
-            f"GMFlow checkpoint not found: {ckpt}. "
-            "Pass --gmflow-ckpt /path/to/gmflow_sintel-0c07dcb3.pth."
+            f"GMFlow checkpoint not found: {requested}. "
+            "Pass --gmflow-ckpt, set GMFLOW_CKPT, or keep "
+            "gmflow_sintel-0c07dcb3.pth under GMFlow pretrained/models."
         )
 
     device = torch.device(device)
@@ -154,7 +220,16 @@ def load_gmflow(
     # visibility computation uses RGB in [0, 1], so compute_opw scales images
     # back to [0, 255] only for models loaded through this helper.
     model._capa_expects_rgb_255 = True  # type: ignore[attr-defined]
-    model._capa_pad_to_multiple = 8  # type: ignore[attr-defined]
+    model._capa_pad_to_multiple = 16  # type: ignore[attr-defined]
+    model._capa_gmflow_kwargs = {  # type: ignore[attr-defined]
+        "attn_splits_list": [2],
+        "corr_radius_list": [-1],
+        "prop_radius_list": [-1],
+    }
+    model._capa_gmflow_repo = (  # type: ignore[attr-defined]
+        str(resolved_repo) if resolved_repo is not None else None
+    )
+    model._capa_gmflow_ckpt = str(ckpt)  # type: ignore[attr-defined]
     return model
 
 
@@ -188,7 +263,8 @@ def bilinear_warp_by_backward_flow(
         raise ValueError(f"flow must have shape [B,2,H,W], got {tuple(flow.shape)}")
     if x.shape[0] != flow.shape[0] or x.shape[-2:] != flow.shape[-2:]:
         raise ValueError(
-            f"x and flow batch/spatial shapes must match, got {tuple(x.shape)} and {tuple(flow.shape)}"
+            "x and flow batch/spatial shapes must match, got "
+            f"{tuple(x.shape)} and {tuple(flow.shape)}"
         )
 
     B, _, H, W = x.shape
@@ -260,31 +336,40 @@ def _extract_flow_tensor(flow_output: Any) -> torch.Tensor:
     raise RuntimeError(f"Flow tensor must have 2 channels, got {tuple(flow.shape)}")
 
 
-def _pad_to_multiple(x: torch.Tensor, multiple: int) -> tuple[torch.Tensor, tuple[int, int]]:
-    """Pad bottom/right with replication so H and W are divisible by ``multiple``."""
+def _pad_to_multiple(
+    x: torch.Tensor, multiple: int
+) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
+    """Pad symmetrically with replication so H and W are divisible by ``multiple``."""
     if multiple <= 1:
-        return x, (0, 0)
+        return x, (0, 0, 0, 0)
     H, W = x.shape[-2:]
     pad_h = (multiple - H % multiple) % multiple
     pad_w = (multiple - W % multiple) % multiple
     if pad_h == 0 and pad_w == 0:
-        return x, (0, 0)
-    return F.pad(x, (0, pad_w, 0, pad_h), mode="replicate"), (pad_h, pad_w)
+        return x, (0, 0, 0, 0)
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad = (pad_left, pad_right, pad_top, pad_bottom)
+    return F.pad(x, pad, mode="replicate"), pad
 
 
-def _unpad_flow(flow: torch.Tensor, pad_hw: tuple[int, int]) -> torch.Tensor:
-    """Remove bottom/right padding from a flow tensor."""
-    pad_h, pad_w = pad_hw
+def _unpad_flow(flow: torch.Tensor, pad: tuple[int, int, int, int]) -> torch.Tensor:
+    """Remove symmetric padding from a flow tensor."""
+    pad_left, pad_right, pad_top, pad_bottom = pad
     H, W = flow.shape[-2:]
-    end_h = H - pad_h if pad_h else H
-    end_w = W - pad_w if pad_w else W
-    return flow[..., :end_h, :end_w]
+    end_h = H - pad_bottom if pad_bottom else H
+    end_w = W - pad_right if pad_right else W
+    return flow[..., pad_top:end_h, pad_left:end_w]
 
 
 def _run_flow_model(
     flow_model: Any,
     image0: torch.Tensor,
     image1: torch.Tensor,
+    batch_size: int | None = None,
+    max_side: int | None = None,
 ) -> torch.Tensor:
     """
     Run a generic flow model from ``image0`` to ``image1`` and return pixel flow.
@@ -293,19 +378,61 @@ def _run_flow_model(
     inference kwargs and images scaled to [0, 255].  Generic unit-test fakes are
     called with the normalized tensors unchanged.
     """
+    if batch_size is not None:
+        if batch_size <= 0:
+            raise ValueError(f"flow batch_size must be positive, got {batch_size}")
+        if image0.shape[0] > batch_size:
+            flows = [
+                _run_flow_model(
+                    flow_model,
+                    image0[start : start + batch_size],
+                    image1[start : start + batch_size],
+                    max_side=max_side,
+                )
+                for start in range(0, image0.shape[0], batch_size)
+            ]
+            return torch.cat(flows, dim=0)
+
+    if max_side is not None and max_side <= 0:
+        raise ValueError(f"flow max_side must be positive, got {max_side}")
+
+    original_h, original_w = image0.shape[-2:]
+    resized = max_side is not None and max(original_h, original_w) > max_side
+    if resized:
+        resize_scale = float(max_side) / float(max(original_h, original_w))
+        inference_h = max(1, int(round(original_h * resize_scale)))
+        inference_w = max(1, int(round(original_w * resize_scale)))
+        image0 = F.interpolate(
+            image0,
+            size=(inference_h, inference_w),
+            mode="bilinear",
+            align_corners=True,
+        )
+        image1 = F.interpolate(
+            image1,
+            size=(inference_h, inference_w),
+            mode="bilinear",
+            align_corners=True,
+        )
+
     expects_rgb_255 = bool(getattr(flow_model, "_capa_expects_rgb_255", False))
     pad_multiple = int(getattr(flow_model, "_capa_pad_to_multiple", 1))
 
     image0_for_flow = image0 * 255.0 if expects_rgb_255 else image0
     image1_for_flow = image1 * 255.0 if expects_rgb_255 else image1
-    image0_for_flow, pad_hw = _pad_to_multiple(image0_for_flow, pad_multiple)
-    image1_for_flow, _ = _pad_to_multiple(image1_for_flow, pad_multiple)
+    image0_for_flow, pad = _pad_to_multiple(image0_for_flow, pad_multiple)
+    if any(pad):
+        image1_for_flow = F.pad(image1_for_flow, pad, mode="replicate")
 
-    gmflow_kwargs = {
-        "attn_splits_list": [2],
-        "corr_radius_list": [-1],
-        "prop_radius_list": [-1],
-    }
+    gmflow_kwargs = getattr(
+        flow_model,
+        "_capa_gmflow_kwargs",
+        {
+            "attn_splits_list": [2],
+            "corr_radius_list": [-1],
+            "prop_radius_list": [-1],
+        },
+    )
     with torch.no_grad():
         try:
             output = flow_model(image0_for_flow, image1_for_flow, **gmflow_kwargs)
@@ -313,7 +440,17 @@ def _run_flow_model(
             output = flow_model(image0_for_flow, image1_for_flow)
 
     flow = _extract_flow_tensor(output)
-    flow = _unpad_flow(flow, pad_hw)
+    flow = _unpad_flow(flow, pad)
+    if resized:
+        inference_h, inference_w = flow.shape[-2:]
+        flow = F.interpolate(
+            flow,
+            size=(original_h, original_w),
+            mode="bilinear",
+            align_corners=True,
+        )
+        flow[:, 0] *= float(original_w) / float(inference_w)
+        flow[:, 1] *= float(original_h) / float(inference_h)
     return flow.to(device=image0.device, dtype=image0.dtype)
 
 
@@ -321,11 +458,13 @@ def _forward_backward_consistency_mask(
     backward_flow: torch.Tensor,
     forward_flow: torch.Tensor,
 ) -> torch.Tensor:
-    """Optional conservative forward/backward consistency mask in target frame."""
+    """GMFlow/UnFlow forward-backward consistency mask in target coordinates."""
     warped_forward, valid = bilinear_warp_by_backward_flow(forward_flow, backward_flow)
     fb_error = torch.linalg.vector_norm(backward_flow + warped_forward, dim=1)
+    # Match GMFlow's forward_backward_consistency_check exactly: the threshold
+    # magnitude uses the two unwarped flow fields at the same array location.
     fb_mag = torch.linalg.vector_norm(backward_flow, dim=1) + torch.linalg.vector_norm(
-        warped_forward, dim=1
+        forward_flow, dim=1
     )
     return valid & (fb_error <= 0.01 * fb_mag + 0.5)
 
@@ -338,6 +477,9 @@ def compute_opw(
     fb_consistency: bool = False,
     return_details: bool = False,
     opw_mode: str = "capa_strict",
+    eval_mask: torch.Tensor | None = None,
+    flow_batch_size: int | None = None,
+    flow_max_side: int | None = None,
 ) -> float | tuple[float, dict[str, Any]]:
     """
     Compute CAPA's optical-flow-based warping error (OPW).
@@ -358,6 +500,15 @@ def compute_opw(
             denominator valid counts, weight sums, beta, mode, and whether
             forward/backward consistency was used.
         opw_mode: only ``"capa_strict"`` is currently implemented.
+        eval_mask: evaluated-pixel mask ``Omega`` with shape ``[T,H,W]``.
+            CAPA defines this as the valid dense ground-truth depth mask. It is
+            required in strict mode and is never inferred from the prediction.
+        flow_batch_size: optional maximum number of adjacent frame pairs passed
+            to the flow model at once. It controls peak memory without changing
+            the OPW formula.
+        flow_max_side: optional maximum image side for flow inference. The flow
+            is resized and vector-scaled back to the original pixel grid using
+            GMFlow's official inference-size convention.
 
     Returns:
         Reported OPW multiplied by 100.  In CAPA strict mode, depth is used in
@@ -376,10 +527,31 @@ def compute_opw(
             f"depth_pred and rgb temporal/spatial shapes must match, got "
             f"{tuple(depth_pred.shape)} and {tuple(rgb.shape)}"
         )
+    if isinstance(beta, bool) or not math.isfinite(float(beta)) or beta < 0:
+        raise ValueError(f"beta must be a finite non-negative number, got {beta!r}")
 
     device = depth_pred.device
     depth_pred = depth_pred.float()
     rgb = rgb.to(device=device, dtype=depth_pred.dtype)
+
+    if eval_mask is None:
+        raise ValueError(
+            "CAPA strict OPW requires eval_mask=depth_gt_valid to define Omega"
+        )
+    if eval_mask.shape != depth_pred.shape:
+        raise ValueError(
+            "eval_mask must have the same [T,H,W] shape as depth_pred, got "
+            f"{tuple(eval_mask.shape)} and {tuple(depth_pred.shape)}"
+        )
+    eval_mask = eval_mask.to(device=device, dtype=torch.bool)
+    if flow_batch_size is not None and flow_batch_size <= 0:
+        raise ValueError(
+            f"flow_batch_size must be positive when provided, got {flow_batch_size}"
+        )
+    if flow_max_side is not None and flow_max_side <= 0:
+        raise ValueError(
+            f"flow_max_side must be positive when provided, got {flow_max_side}"
+        )
 
     finite_rgb = rgb[torch.isfinite(rgb)]
     if finite_rgb.numel() > 0 and finite_rgb.max() > 2:
@@ -393,6 +565,10 @@ def compute_opw(
                 "per_pair_opw": torch.empty(0, dtype=depth_pred.dtype),
                 "valid_count": torch.empty(0, dtype=torch.long),
                 "weight_sum": torch.empty(0, dtype=depth_pred.dtype),
+                "flow_valid_count": torch.empty(0, dtype=torch.long),
+                "valid_weight_count": torch.empty(0, dtype=torch.long),
+                "invalid_correspondence_count": torch.empty(0, dtype=torch.long),
+                "invalid_warped_depth_count": torch.empty(0, dtype=torch.long),
                 "beta": float(beta),
                 "opw_mode": opw_mode,
                 "fb_consistency": bool(fb_consistency),
@@ -406,15 +582,24 @@ def compute_opw(
     tgt_rgb = rgb_clean[1:]
     src_depth = depth_pred[:-1]
     tgt_depth = depth_pred[1:]
+    omega = eval_mask[1:]
 
-    backward_flow = _run_flow_model(flow_model, tgt_rgb, src_rgb)
+    backward_flow = _run_flow_model(
+        flow_model,
+        tgt_rgb,
+        src_rgb,
+        batch_size=flow_batch_size,
+        max_side=flow_max_side,
+    )
     if backward_flow.shape != (T - 1, 2, H, W):
         raise RuntimeError(
             f"Backward flow must have shape {(T - 1, 2, H, W)}, got {tuple(backward_flow.shape)}"
         )
 
+    # Metric depth must be finite and strictly positive. CAPA Eq. (10) states
+    # that invalid warped depth receives zero visibility weight.
     source_depth_valid = torch.isfinite(src_depth) & (src_depth > 0)
-    current_depth_valid = torch.isfinite(tgt_depth) & (tgt_depth > 0)
+    current_depth_valid = torch.isfinite(tgt_depth)
     source_depth_clean = torch.where(source_depth_valid, src_depth, torch.zeros_like(src_depth))
 
     warped_depth, flow_valid = bilinear_warp_by_backward_flow(
@@ -444,7 +629,13 @@ def compute_opw(
     )
 
     if fb_consistency:
-        forward_flow = _run_flow_model(flow_model, src_rgb, tgt_rgb)
+        forward_flow = _run_flow_model(
+            flow_model,
+            src_rgb,
+            tgt_rgb,
+            batch_size=flow_batch_size,
+            max_side=flow_max_side,
+        )
         if forward_flow.shape != (T - 1, 2, H, W):
             raise RuntimeError(
                 f"Forward flow must have shape {(T - 1, 2, H, W)}, got {tuple(forward_flow.shape)}"
@@ -462,13 +653,11 @@ def compute_opw(
         torch.isfinite(depth_abs_diff), depth_abs_diff, torch.zeros_like(depth_abs_diff)
     )
 
-    # CAPA strict: invalid flow/warped-depth locations have zero weight, while
-    # the denominator is the evaluated target-pixel set Ω.  With no external GT
-    # mask in this API, Ω is the set of finite positive current predicted depth
-    # pixels with finite current RGB.
-    omega = current_depth_valid & rgb_finite[1:]
+    # CAPA Eq. (9): Omega is the valid dense-GT mask in the target frame. It
+    # controls both the summation domain and the unweighted denominator. Flow,
+    # warped-depth, and RGB validity only zero the visibility weight (Eq. 10).
     valid_count = omega.sum(dim=(-1, -2))
-    numerator = (weight * depth_abs_diff).sum(dim=(-1, -2))
+    numerator = (weight * depth_abs_diff * omega.to(weight.dtype)).sum(dim=(-1, -2))
     denominator = valid_count.clamp(min=1).to(dtype=depth_pred.dtype)
     pair_opw = numerator / denominator
     pair_opw = torch.where(
@@ -477,18 +666,29 @@ def compute_opw(
         torch.full_like(pair_opw, float("nan")),
     )
 
-    finite_pair = torch.isfinite(pair_opw)
-    if finite_pair.any():
-        opw_tensor = pair_opw[finite_pair].mean() * 100.0
-    else:
-        opw_tensor = torch.tensor(float("nan"), device=device, dtype=depth_pred.dtype)
+    opw_tensor = pair_opw.mean() * 100.0
 
     opw = float(opw_tensor.detach().cpu().item())
     if return_details:
+        flow_valid_eval = flow_valid & rgb_flow_valid & omega
+        valid_weight_eval = valid_weight & omega
+        invalid_correspondence = omega & ~(flow_valid & rgb_flow_valid)
+        invalid_warped_depth = (
+            omega & (flow_valid & rgb_flow_valid) & ~warped_source_depth_valid
+        )
         details: dict[str, Any] = {
             "per_pair_opw": (pair_opw.detach().cpu() * 100.0),
             "valid_count": valid_count.detach().cpu(),
-            "weight_sum": weight.sum(dim=(-1, -2)).detach().cpu(),
+            "weight_sum": (weight * omega.to(weight.dtype))
+            .sum(dim=(-1, -2))
+            .detach()
+            .cpu(),
+            "flow_valid_count": flow_valid_eval.sum(dim=(-1, -2)).detach().cpu(),
+            "valid_weight_count": valid_weight_eval.sum(dim=(-1, -2)).detach().cpu(),
+            "invalid_correspondence_count": invalid_correspondence.sum(dim=(-1, -2)).detach().cpu(),
+            "invalid_warped_depth_count": (
+                invalid_warped_depth.sum(dim=(-1, -2)).detach().cpu()
+            ),
             "beta": float(beta),
             "opw_mode": opw_mode,
             "fb_consistency": bool(fb_consistency),
@@ -729,7 +929,9 @@ def average_metrics(
     """
     Average numeric values across a list of metric dicts.
 
-    Non-numeric or NaN values are skipped per key.
+    Non-numeric and non-finite values are skipped per key. Keys with no finite
+    observations are omitted: absence means "not computed", whereas JSON null
+    is reserved for an unavailable value on an individual sample.
     """
     keys_to_ignore = set(ignore_keys) if ignore_keys else set()
     all_keys = sorted({k for d in list_of_dicts for k in d.keys()} - keys_to_ignore)
@@ -737,15 +939,15 @@ def average_metrics(
     result: dict[str, Any] = {}
     for k in all_keys:
         values = [
-            d[k]
+            float(value)
             for d in list_of_dicts
-            if isinstance(d.get(k), (int, float)) and d.get(k) == d.get(k)  # NaN check
+            if isinstance((value := d.get(k)), (int, float))
+            and math.isfinite(float(value))
         ]
         if not values:
-            logger.warning("No valid values found for key `%s`", k)
-            result[k] = float("nan")
-        else:
-            result[k] = sum(values) / len(values)
+            logger.info("Omitting metric key `%s`: no finite values were computed", k)
+            continue
+        result[k] = sum(values) / len(values)
 
     return result
 
