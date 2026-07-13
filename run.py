@@ -4,8 +4,8 @@
 CAPA: depth Completion As Parameter-efficient Adaptation.
 
 Usage:
-    # Recommended baseline: cache predictions without loading GMFlow. Compute
-    # OPW afterwards with scripts/audit_opw_metric.py.
+    # High-resolution baseline: cache predictions without loading GMFlow, then
+    # compute OPW with scripts/audit_opw_metric.py.
     CUDA_VISIBLE_DEVICES=7 python run.py \
         --config config/vggt_baseline.yaml \
         --input dataset/metropolis/metropolis_8line_noisy_v3 \
@@ -35,11 +35,13 @@ from tqdm import tqdm
 from capa import CAPAProtocol
 from capa.utils.logging import get_local_logger
 from capa.utils.metric import (
+    OPW_PROTOCOL,
     average_metrics,
     compute_depth_metrics,
     compute_opw,
     format_metrics,
     load_gmflow,
+    resolve_gmflow_paths,
 )
 from capa.utils.visualize import save_depth_vis, save_side_by_side_vis
 
@@ -65,6 +67,7 @@ def _build_opw_evaluation_metadata(
     avg_metrics: dict,
     per_sample: list[dict],
     gmflow_ckpt: str | None,
+    gmflow_repo: str | None,
     beta: float,
     fb_consistency: bool,
     flow_batch_size: int | None,
@@ -99,10 +102,10 @@ def _build_opw_evaluation_metadata(
         "num_valid_scenes": finite_opw_count if online_opw else None,
         "num_total_scenes": finite_opw_count if online_opw else None,
         "gmflow_ckpt": gmflow_ckpt if online_opw else None,
-        "gmflow_repo": None,
+        "gmflow_repo": gmflow_repo if online_opw else None,
         "beta": beta if online_opw else None,
         "fb_consistency": fb_consistency if online_opw else None,
-        "opw_mode": "capa_strict" if online_opw else None,
+        "protocol": OPW_PROTOCOL if online_opw else None,
         "depth_key": "depth_pred_nhw" if online_opw else None,
         "eval_mask_key": "depth_gt_nvhw" if online_opw else None,
         "flow_batch_size": flow_batch_size if online_opw else None,
@@ -256,7 +259,6 @@ def process_samples(
     save_pt: bool,
     fps: int,
     result_file: Path | None = None,
-    gmflow_ckpt: str | None = None,
     online_opw: bool = False,
     opw_beta: float = 50.0,
     opw_fb_consistency: bool = False,
@@ -277,7 +279,6 @@ def process_samples(
         save_pt: whether to save per-sample _pred.pt files
         fps: FPS for video output
         result_file: if provided, write (metrics, times) to this file for cross-process collection
-        gmflow_ckpt: GMFlow checkpoint used when online_opw is enabled.
         online_opw: compute OPW inside this run. Offline audit is preferred for
             high-resolution clips because VGGT and GMFlow otherwise share VRAM.
         opw_beta: RGB visibility-weight beta.
@@ -292,7 +293,7 @@ def process_samples(
     protocol = CAPAProtocol(config, device)
     seed = int(config.get("seed", 42))
 
-    # GMFlow is loaded lazily only for explicitly requested online OPW.
+    # GMFlow is loaded lazily when online OPW reaches its first video sample.
     flow_model: torch.nn.Module | None = None
 
     all_metrics: list[dict] = []
@@ -412,7 +413,7 @@ def process_samples(
             if online_opw and depth_pred_nhw.shape[0] >= 2:
                 if flow_model is None:
                     try:
-                        flow_model = load_gmflow(gmflow_ckpt, device)
+                        flow_model = load_gmflow(device=device)
                     except Exception as exc:
                         raise RuntimeError(
                             "Online OPW was requested but GMFlow could not be loaded. "
@@ -428,7 +429,6 @@ def process_samples(
                         flow_model=flow_model,
                         beta=opw_beta,
                         fb_consistency=opw_fb_consistency,
-                        opw_mode="capa_strict",
                         eval_mask=torch.isfinite(depth_gt) & (depth_gt > 0),
                         flow_batch_size=opw_flow_batch_size,
                         flow_max_side=opw_flow_max_side,
@@ -540,7 +540,6 @@ def _worker_fn(
     save_pt: bool,
     fps: int,
     tmp_dir: Path,
-    gmflow_ckpt: str | None = None,
     online_opw: bool = False,
     opw_beta: float = 50.0,
     opw_fb_consistency: bool = False,
@@ -569,7 +568,6 @@ def _worker_fn(
         save_pt=save_pt,
         fps=fps,
         result_file=result_file,
-        gmflow_ckpt=gmflow_ckpt,
         online_opw=online_opw,
         opw_beta=opw_beta,
         opw_fb_consistency=opw_fb_consistency,
@@ -590,35 +588,13 @@ def main():
         help="Path to input .pt file or directory",
     )
     parser.add_argument("--output", "-o", type=str, default="output", help="Output directory")
-    opw_group = parser.add_mutually_exclusive_group()
-    opw_group.add_argument(
-        "--compute-opw",
-        action="store_true",
-        help=(
-            "Compute OPW online. This loads GMFlow alongside the depth model; "
-            "for high-resolution clips prefer --no-opw followed by "
-            "scripts/audit_opw_metric.py."
-        ),
-    )
-    opw_group.add_argument(
+    parser.add_argument(
         "--no-opw",
         action="store_true",
-        help="Explicitly skip OPW. The summary omits the opw metric instead of writing NaN.",
-    )
-    parser.add_argument(
-        "--gmflow-ckpt",
-        type=str,
-        default=None,
         help=(
-            "Path to the GMFlow checkpoint. Supplying this implies --compute-opw "
-            "for backward compatibility."
+            "Skip online OPW. For high-resolution prediction caching, run the "
+            "offline audit afterwards; summary omits OPW until that audit merges."
         ),
-    )
-    parser.add_argument(
-        "--opw-beta",
-        type=float,
-        default=50.0,
-        help="RGB visibility-weight beta for online OPW (default: 50).",
     )
     parser.add_argument(
         "--opw-fb-consistency",
@@ -628,8 +604,8 @@ def main():
     parser.add_argument(
         "--opw-flow-batch-size",
         type=int,
-        default=None,
-        help="Maximum adjacent frame pairs per online GMFlow call.",
+        default=2,
+        help="Maximum adjacent frame pairs per online GMFlow call (default: 2).",
     )
     parser.add_argument(
         "--opw-flow-max-side",
@@ -663,26 +639,19 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG logging")
     args = parser.parse_args()
 
-    if args.no_opw and args.gmflow_ckpt is not None:
-        parser.error("--no-opw cannot be combined with --gmflow-ckpt")
-    if args.opw_beta <= 0:
-        parser.error("--opw-beta must be positive")
     if args.opw_flow_batch_size is not None and args.opw_flow_batch_size <= 0:
         parser.error("--opw-flow-batch-size must be positive")
     if args.opw_flow_max_side is not None and args.opw_flow_max_side <= 0:
         parser.error("--opw-flow-max-side must be positive")
 
-    online_opw = bool(args.compute_opw or args.gmflow_ckpt is not None)
-    if args.no_opw:
-        online_opw = False
+    online_opw = not args.no_opw
     opw_options_used = (
         args.opw_fb_consistency
-        or args.opw_flow_batch_size is not None
+        or args.opw_flow_batch_size != 2
         or args.opw_flow_max_side is not None
-        or args.opw_beta != 50.0
     )
     if opw_options_used and not online_opw:
-        parser.error("Online OPW options require --compute-opw")
+        parser.error("Online OPW options cannot be combined with --no-opw")
 
     # --save-vis implies --save-pt (visualization needs cached predictions for replay)
     save_pt = args.save_pt or args.save_vis
@@ -717,26 +686,19 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve GMFlow only when online OPW was explicitly requested. Keeping the
-    # default baseline path OPW-free avoids loading two large models together.
-    gmflow_ckpt = args.gmflow_ckpt if online_opw else None
-    if online_opw and gmflow_ckpt is None:
-        candidates = [
-            Path.home() / "gmflow" / "pretrained" / "models" / "gmflow_sintel-0c07dcb3.pth",
-            _PROJECT_ROOT / "gmflow" / "pretrained" / "models" / "gmflow_sintel-0c07dcb3.pth",
-        ]
-        for c in candidates:
-            if c.exists():
-                gmflow_ckpt = str(c)
-                logger.info(f"Auto-detected GMFlow checkpoint: {gmflow_ckpt}")
-                break
-    if online_opw and gmflow_ckpt is None:
-        parser.error(
-            "--compute-opw requires a GMFlow checkpoint. Pass --gmflow-ckpt "
-            "or place gmflow_sintel-0c07dcb3.pth under ~/gmflow/pretrained/models."
-        )
+    gmflow_repo: str | None = None
+    gmflow_ckpt: str | None = None
     if online_opw:
-        logger.info("Online OPW requested; failures will abort the run.")
+        try:
+            resolved_repo, resolved_ckpt = resolve_gmflow_paths()
+        except (ImportError, FileNotFoundError) as exc:
+            parser.error(str(exc))
+        gmflow_repo = str(resolved_repo)
+        gmflow_ckpt = str(resolved_ckpt)
+        logger.info(
+            "Online OPW enabled with auto-detected GMFlow: "
+            f"repo={gmflow_repo}, checkpoint={gmflow_ckpt}"
+        )
     else:
         logger.info("OPW not requested; summary.json will omit avg_metrics.opw.")
 
@@ -763,9 +725,8 @@ def main():
             save_vis=args.save_vis,
             save_pt=save_pt,
             fps=args.fps,
-            gmflow_ckpt=gmflow_ckpt,
             online_opw=online_opw,
-            opw_beta=args.opw_beta,
+            opw_beta=50.0,
             opw_fb_consistency=args.opw_fb_consistency,
             opw_flow_batch_size=args.opw_flow_batch_size,
             opw_flow_max_side=args.opw_flow_max_side,
@@ -789,9 +750,8 @@ def main():
                 save_pt,
                 args.fps,
                 tmp_dir,
-                gmflow_ckpt,
                 online_opw,
-                args.opw_beta,
+                50.0,
                 args.opw_fb_consistency,
                 args.opw_flow_batch_size,
                 args.opw_flow_max_side,
@@ -841,7 +801,8 @@ def main():
                 avg_metrics=avg,
                 per_sample=all_metrics,
                 gmflow_ckpt=gmflow_ckpt,
-                beta=args.opw_beta,
+                gmflow_repo=gmflow_repo,
+                beta=50.0,
                 fb_consistency=args.opw_fb_consistency,
                 flow_batch_size=args.opw_flow_batch_size,
                 flow_max_side=args.opw_flow_max_side,

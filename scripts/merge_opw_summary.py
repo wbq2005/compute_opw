@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Merge an existing offline OPW audit into summary.json.
 
-Use this only when the audit JSON already exists and was not created with
-``audit_opw_metric.py --update-summary``::
+Use this for an existing audit JSON or for merging disjoint audit shards.
+Normal full runs of ``audit_opw_metric.py`` update the adjacent summary
+automatically::
 
     python scripts/merge_opw_summary.py \
       --summary output/noise_probe/metropolis_8line_v3/vggt/summary.json \
@@ -21,6 +22,8 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+OPW_PROTOCOL = "capa_strict"
 
 
 def _scene_name(item: dict[str, Any]) -> str | None:
@@ -106,6 +109,14 @@ def _merge_audits(opw_paths: list[Path]) -> tuple[dict[str, Any], dict[str, floa
         raise ValueError("At least one OPW audit JSON is required")
 
     audits = [_load_strict_json(path) for path in opw_paths]
+    for path, audit in zip(opw_paths, audits):
+        # Older completed audits used ``opw_mode`` before the strict-only API.
+        protocol = audit.get("protocol", audit.pop("opw_mode", None))
+        if protocol != OPW_PROTOCOL:
+            raise ValueError(
+                f"{path}: expected OPW protocol {OPW_PROTOCOL!r}, got {protocol!r}"
+            )
+        audit["protocol"] = protocol
     shared_keys = (
         "input_dir",
         "pred_dir",
@@ -113,7 +124,7 @@ def _merge_audits(opw_paths: list[Path]) -> tuple[dict[str, Any], dict[str, floa
         "gmflow_repo",
         "beta",
         "fb_consistency",
-        "opw_mode",
+        "protocol",
         "depth_key",
         "eval_mask_key",
         "flow_batch_size",
@@ -262,7 +273,7 @@ def merge_summary(
         "gmflow_repo": audit.get("gmflow_repo"),
         "beta": audit.get("beta"),
         "fb_consistency": audit.get("fb_consistency"),
-        "opw_mode": audit.get("opw_mode"),
+        "protocol": audit.get("protocol"),
         "depth_key": audit.get("depth_key"),
         "eval_mask_key": audit.get("eval_mask_key"),
         "flow_batch_size": audit.get("flow_batch_size"),

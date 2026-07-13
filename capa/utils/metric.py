@@ -13,13 +13,14 @@ from .logging import get_local_logger
 
 logger = get_local_logger(__name__)
 
+OPW_PROTOCOL = "capa_strict"
 
 _GMFLOW_HELP = (
     "GMFlow is required for real OPW evaluation but could not be imported. "
     "Clone https://github.com/haofeixu/gmflow, set GMFLOW_REPO=/path/to/gmflow, "
-    "or place the checkout at third_party/gmflow. Pass --gmflow-ckpt, set "
-    "GMFLOW_CKPT, or keep gmflow_sintel-0c07dcb3.pth under the GMFlow "
-    "pretrained/models directory."
+    "or place the checkout at ~/gmflow or third_party/gmflow. Set GMFLOW_CKPT "
+    "only for a non-standard checkpoint location; otherwise keep "
+    "gmflow_sintel-0c07dcb3.pth under GMFlow pretrained/models."
 )
 
 
@@ -72,6 +73,7 @@ def _resolve_gmflow_repo(gmflow_repo: str | os.PathLike[str] | None = None) -> P
     repo_root = Path(__file__).resolve().parents[2]
     candidates.extend(
         [
+            Path.home() / "gmflow",
             repo_root / "third_party" / "gmflow",
             repo_root / "gmflow",
             repo_root / "gmflow(1)" / "gmflow",
@@ -117,6 +119,11 @@ def _resolve_gmflow_ckpt(
     repo_root = Path(__file__).resolve().parents[2]
     candidates.extend(
         [
+            Path.home()
+            / "gmflow"
+            / "pretrained"
+            / "models"
+            / "gmflow_sintel-0c07dcb3.pth",
             repo_root
             / "gmflow(1)"
             / "gmflow"
@@ -144,9 +151,29 @@ def _resolve_gmflow_ckpt(
     return None
 
 
+def resolve_gmflow_paths(
+    ckpt_path: str | os.PathLike[str] | None = None,
+    gmflow_repo: str | os.PathLike[str] | None = None,
+) -> tuple[Path, Path]:
+    """Resolve the GMFlow checkout and Sintel checkpoint without loading CUDA."""
+    resolved_repo = _resolve_gmflow_repo(gmflow_repo)
+    if resolved_repo is None:
+        raise ImportError(_GMFLOW_HELP)
+
+    resolved_ckpt = _resolve_gmflow_ckpt(ckpt_path, resolved_repo)
+    if resolved_ckpt is None:
+        requested = Path(ckpt_path).expanduser() if ckpt_path is not None else None
+        raise FileNotFoundError(
+            f"GMFlow checkpoint not found: {requested}. "
+            "Set GMFLOW_CKPT or keep gmflow_sintel-0c07dcb3.pth under "
+            "the detected GMFlow pretrained/models directory."
+        )
+    return resolved_repo, resolved_ckpt
+
+
 def load_gmflow(
-    ckpt_path: str | os.PathLike[str] | None,
-    device: torch.device | str,
+    ckpt_path: str | os.PathLike[str] | None = None,
+    device: torch.device | str = "cuda",
     gmflow_repo: str | os.PathLike[str] | None = None,
 ) -> torch.nn.Module:
     """
@@ -156,29 +183,21 @@ def load_gmflow(
     order is:
       1. explicit ``gmflow_repo`` argument;
       2. ``GMFLOW_REPO`` environment variable;
-      3. ``third_party/gmflow`` under the project root, if present.
+      3. ``~/gmflow``;
+      4. ``third_party/gmflow`` or ``gmflow`` under the project root.
 
     Raises:
         ImportError: if GMFlow cannot be imported.
         FileNotFoundError: if the checkpoint path does not exist.
     """
-    resolved_repo = _resolve_gmflow_repo(gmflow_repo)
-    if resolved_repo is not None and str(resolved_repo) not in sys.path:
+    resolved_repo, ckpt = resolve_gmflow_paths(ckpt_path, gmflow_repo)
+    if str(resolved_repo) not in sys.path:
         sys.path.insert(0, str(resolved_repo))
 
     try:
         from gmflow.gmflow import GMFlow
     except Exception as exc:  # pragma: no cover - depends on external GMFlow
         raise ImportError(_GMFLOW_HELP) from exc
-
-    ckpt = _resolve_gmflow_ckpt(ckpt_path, resolved_repo)
-    if ckpt is None:
-        requested = Path(ckpt_path).expanduser() if ckpt_path is not None else None
-        raise FileNotFoundError(
-            f"GMFlow checkpoint not found: {requested}. "
-            "Pass --gmflow-ckpt, set GMFLOW_CKPT, or keep "
-            "gmflow_sintel-0c07dcb3.pth under GMFlow pretrained/models."
-        )
 
     device = torch.device(device)
     model = GMFlow(
@@ -472,11 +491,10 @@ def _forward_backward_consistency_mask(
 def compute_opw(
     depth_pred: torch.Tensor,
     rgb: torch.Tensor,
-    flow_model: Any,
+    flow_model: Any | None = None,
     beta: float = 50.0,
     fb_consistency: bool = False,
     return_details: bool = False,
-    opw_mode: str = "capa_strict",
     eval_mask: torch.Tensor | None = None,
     flow_batch_size: int | None = None,
     flow_max_side: int | None = None,
@@ -489,7 +507,9 @@ def compute_opw(
         rgb: RGB frames with shape ``[T, 3, H, W]``.  Values should be float
             in ``[0, 1]``; if the maximum finite value is greater than 2, the
             tensor is automatically divided by 255.
-        flow_model: callable/module that predicts flow from image0 to image1.
+        flow_model: optional callable/module that predicts flow from image0 to image1.
+            When omitted, GMFlow and its Sintel checkpoint are discovered from
+            the standard repository locations and loaded automatically.
             For each adjacent pair, OPW calls it as ``flow_model(I[t+1], I[t])``
             to obtain the backward flow ``F_{t+1=>t}``.
         beta: visibility-weight coefficient.  CAPA uses 50.
@@ -497,9 +517,8 @@ def compute_opw(
             Disabled by default because it is not part of CAPA strict OPW.
         return_details: if true, return ``(opw, details)``.  ``details`` contains
             reported-scale per-pair OPW values (also multiplied by 100),
-            denominator valid counts, weight sums, beta, mode, and whether
+            denominator valid counts, weight sums, beta, protocol, and whether
             forward/backward consistency was used.
-        opw_mode: only ``"capa_strict"`` is currently implemented.
         eval_mask: evaluated-pixel mask ``Omega`` with shape ``[T,H,W]``.
             CAPA defines this as the valid dense ground-truth depth mask. It is
             required in strict mode and is never inferred from the prediction.
@@ -514,10 +533,6 @@ def compute_opw(
         Reported OPW multiplied by 100.  In CAPA strict mode, depth is used in
         metric scale without median/mean/MAD/min-max normalization.
     """
-    if opw_mode != "capa_strict":
-        raise NotImplementedError(
-            f"Unsupported OPW mode {opw_mode!r}. Only 'capa_strict' is implemented."
-        )
     if depth_pred.ndim != 3:
         raise ValueError(f"depth_pred must have shape [T,H,W], got {tuple(depth_pred.shape)}")
     if rgb.ndim != 4 or rgb.shape[1] != 3:
@@ -570,10 +585,13 @@ def compute_opw(
                 "invalid_correspondence_count": torch.empty(0, dtype=torch.long),
                 "invalid_warped_depth_count": torch.empty(0, dtype=torch.long),
                 "beta": float(beta),
-                "opw_mode": opw_mode,
+                "protocol": OPW_PROTOCOL,
                 "fb_consistency": bool(fb_consistency),
             }
         return opw
+
+    if flow_model is None:
+        flow_model = load_gmflow(device=device)
 
     rgb_clean = torch.nan_to_num(rgb, nan=0.0, posinf=0.0, neginf=0.0)
     rgb_finite = torch.isfinite(rgb).all(dim=1)
@@ -690,7 +708,7 @@ def compute_opw(
                 invalid_warped_depth.sum(dim=(-1, -2)).detach().cpu()
             ),
             "beta": float(beta),
-            "opw_mode": opw_mode,
+            "protocol": OPW_PROTOCOL,
             "fb_consistency": bool(fb_consistency),
         }
         return opw, details

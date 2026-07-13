@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 
+import capa.utils.metric as metric
 from capa.utils.metric import bilinear_warp_by_backward_flow, compute_opw
 from capa.utils.metric import _forward_backward_consistency_mask, _run_flow_model
 
@@ -73,6 +74,39 @@ class RightSamplingFlowModel(torch.nn.Module):
 
 def all_pixels(depth: torch.Tensor) -> torch.Tensor:
     return torch.ones_like(depth, dtype=torch.bool)
+
+
+def test_resolve_gmflow_paths_finds_standard_checkpoint(tmp_path):
+    repo = tmp_path / "gmflow"
+    (repo / "gmflow").mkdir(parents=True)
+    (repo / "gmflow" / "gmflow.py").touch()
+    checkpoint = repo / "pretrained" / "models" / "gmflow_sintel-test.pth"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+
+    resolved_repo, resolved_checkpoint = metric.resolve_gmflow_paths(
+        gmflow_repo=repo
+    )
+
+    assert resolved_repo == repo.resolve()
+    assert resolved_checkpoint == checkpoint.resolve()
+
+
+def test_compute_opw_auto_loads_gmflow_when_model_is_omitted(monkeypatch):
+    depth = torch.stack([torch.ones(2, 3), torch.full((2, 3), 1.1)])
+    rgb = torch.zeros(2, 3, 2, 3)
+    loaded: list[torch.device] = []
+
+    def fake_load_gmflow(*, device):
+        loaded.append(torch.device(device))
+        return FakeFlowModel()
+
+    monkeypatch.setattr(metric, "load_gmflow", fake_load_gmflow)
+
+    opw = compute_opw(depth, rgb, eval_mask=all_pixels(depth))
+
+    assert loaded == [torch.device("cpu")]
+    assert opw == pytest.approx(10.0, abs=1e-5)
 
 
 def test_warp_zero_flow_identity():
@@ -228,6 +262,7 @@ def test_compute_opw_details_include_formula_validity_counts():
     assert details["valid_weight_count"].tolist() == [H * W]
     assert details["invalid_correspondence_count"].tolist() == [0]
     assert details["invalid_warped_depth_count"].tolist() == [0]
+    assert details["protocol"] == "capa_strict"
 
 
 def test_compute_opw_uses_dense_gt_mask_for_omega():

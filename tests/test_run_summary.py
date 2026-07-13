@@ -9,6 +9,7 @@ def _metadata(online_opw, avg_metrics, per_sample):
         avg_metrics=avg_metrics,
         per_sample=per_sample,
         gmflow_ckpt="/models/gmflow.pth",
+        gmflow_repo="/src/gmflow",
         beta=50.0,
         fb_consistency=True,
         flow_batch_size=2,
@@ -38,7 +39,8 @@ def test_opw_metadata_records_online_protocol_and_coverage():
     assert metadata["mean_opw"] == 2.25
     assert metadata["num_valid_scenes"] == 2
     assert metadata["num_total_scenes"] == 2
-    assert metadata["opw_mode"] == "capa_strict"
+    assert metadata["protocol"] == "capa_strict"
+    assert metadata["gmflow_repo"] == "/src/gmflow"
     assert metadata["depth_key"] == "depth_pred_nhw"
     assert metadata["eval_mask_key"] == "depth_gt_nvhw"
     assert metadata["fb_consistency"] is True

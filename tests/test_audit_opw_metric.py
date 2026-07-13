@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from scripts.audit_opw_metric import _collect_pairs, _write_tsv
+from scripts.audit_opw_metric import (
+    _collect_pairs,
+    _resolve_output_paths,
+    _write_tsv,
+)
 
 
 def _touch(path: Path) -> None:
@@ -40,3 +44,31 @@ def test_write_tsv_uses_atomic_replacement(tmp_path):
 
     assert output.read_text(encoding="utf-8") == "scene\topw\nscene_000\t1.250000\n"
     assert not (tmp_path / ".opw.tsv.tmp").exists()
+
+
+def test_full_audit_defaults_to_artifacts_and_adjacent_summary(tmp_path):
+    pred_dir = tmp_path / "pred"
+    _touch(pred_dir / "summary.json")
+
+    partial, out_json, out_tsv, summary = _resolve_output_paths(
+        pred_dir, 0, None, None, None, None, False
+    )
+
+    assert partial is False
+    assert out_json == pred_dir / "opw.json"
+    assert out_tsv == pred_dir / "opw.tsv"
+    assert summary == pred_dir / "summary.json"
+
+
+def test_probe_uses_separate_artifacts_and_never_auto_merges(tmp_path):
+    pred_dir = tmp_path / "pred"
+    _touch(pred_dir / "summary.json")
+
+    partial, out_json, out_tsv, summary = _resolve_output_paths(
+        pred_dir, 3, 1, None, None, None, False
+    )
+
+    assert partial is True
+    assert out_json == pred_dir / "opw_probe_offset3_n1.json"
+    assert out_tsv == pred_dir / "opw_probe_offset3_n1.tsv"
+    assert summary is None

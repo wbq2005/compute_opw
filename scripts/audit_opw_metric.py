@@ -3,24 +3,15 @@
 
 Recommended Metropolis invocation from the repository root::
 
-    export GMFLOW_REPO=/home/tankh/gmflow
-    export GMFLOW_CKPT=$GMFLOW_REPO/pretrained/models/gmflow_sintel-0c07dcb3.pth
-    export PYTHONPATH="$GMFLOW_REPO:$PYTHONPATH"
-
     CUDA_VISIBLE_DEVICES=7 python -u scripts/audit_opw_metric.py \
-      --gmflow-ckpt "$GMFLOW_CKPT" \
-      --gmflow-repo "$GMFLOW_REPO" \
       --input-dir dataset/metropolis/metropolis_8line_noisy_v3 \
       --pred-dir output/noise_probe/metropolis_8line_v3/vggt \
       --flow-batch-size 2 \
-      --fb-consistency \
-      --out-json output/noise_probe/metropolis_8line_v3/vggt/opw_capa_strict_fb.json \
-      --out-tsv output/noise_probe/metropolis_8line_v3/vggt/opw_capa_strict_fb.tsv \
-      --update-summary output/noise_probe/metropolis_8line_v3/vggt/summary.json
+      --fb-consistency
 
-Do not type OPW values into summary.json manually. ``--update-summary`` checks
-scene coverage and protocol metadata, backs up the old summary, and writes the
-audited values atomically.
+GMFlow is discovered automatically. A full audit writes ``opw.json`` and
+``opw.tsv`` under ``--pred-dir`` and updates the adjacent ``summary.json``.
+Do not type OPW values into summary.json manually.
 """
 
 from __future__ import annotations
@@ -38,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from capa.utils.metric import compute_opw, load_gmflow
+from capa.utils.metric import OPW_PROTOCOL, compute_opw, load_gmflow
 from run import load_sample
 
 
@@ -267,23 +258,35 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _resolve_output_paths(
+    pred_dir: Path,
+    scene_offset: int,
+    max_scenes: int | None,
+    out_json: Path | None,
+    out_tsv: Path | None,
+    summary_path: Path | None,
+    no_update_summary: bool,
+) -> tuple[bool, Path, Path, Path | None]:
+    """Choose deterministic artifacts and only auto-merge complete audits."""
+    partial_audit = bool(scene_offset or max_scenes is not None)
+    suffix = (
+        f"opw_probe_offset{scene_offset}_n{max_scenes}"
+        if partial_audit
+        else "opw"
+    )
+    resolved_json = out_json or pred_dir / f"{suffix}.json"
+    resolved_tsv = out_tsv or pred_dir / f"{suffix}.tsv"
+    resolved_summary = summary_path
+    if resolved_summary is None and not partial_audit and not no_update_summary:
+        candidate = pred_dir / "summary.json"
+        if candidate.is_file():
+            resolved_summary = candidate
+    return partial_audit, resolved_json, resolved_tsv, resolved_summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Batch-compute OPW from cached predictions via compute_opw()."
-    )
-    parser.add_argument(
-        "--gmflow-ckpt",
-        default=None,
-        help=(
-            "Path to GMFlow checkpoint (.pth). If omitted, load_gmflow() tries "
-            "GMFLOW_CKPT and the GMFlow pretrained/models directory."
-        ),
-    )
-    parser.add_argument(
-        "--gmflow-repo",
-        type=str,
-        default=None,
-        help="Optional external GMFlow repository path passed to load_gmflow()",
     )
     parser.add_argument(
         "--input-dir",
@@ -338,16 +341,6 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--no-fb-consistency",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--opw-mode",
-        default="capa_strict",
-        help="OPW mode passed to compute_opw() (default: capa_strict)",
-    )
-    parser.add_argument(
         "--depth-key",
         default="depth_pred_nhw",
         help="Prediction tensor key inside each *_pred.pt file (default: depth_pred_nhw)",
@@ -374,20 +367,31 @@ def main() -> int:
     )
     parser.add_argument(
         "--out-json",
-        type=str,
+        type=Path,
         default=None,
-        help="Optional JSON summary output path",
+        help="Audit JSON path (default: <pred-dir>/opw.json)",
     )
     parser.add_argument(
+        "--summary",
         "--update-summary",
+        dest="summary_path",
         type=Path,
         default=None,
         help=(
-            "After a successful audit, merge --out-json into this summary.json. "
-            "Exact scene coverage is required and the summary is backed up."
+            "Summary to update (default for a full audit: <pred-dir>/summary.json)"
         ),
     )
-    parser.add_argument("--out-tsv", type=str, default=None, help="Optional TSV output path")
+    parser.add_argument(
+        "--no-update-summary",
+        action="store_true",
+        help="Write OPW artifacts without updating summary.json",
+    )
+    parser.add_argument(
+        "--out-tsv",
+        type=Path,
+        default=None,
+        help="Per-scene TSV path (default: <pred-dir>/opw.tsv)",
+    )
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -407,13 +411,8 @@ def main() -> int:
         raise ValueError(f"--flow-max-side must be positive, got {args.flow_max_side}")
     if not math.isfinite(args.beta) or args.beta <= 0:
         raise ValueError(f"--beta must be a finite positive number, got {args.beta!r}")
-    if args.update_summary is not None and args.out_json is None:
-        raise ValueError("--update-summary requires --out-json")
-
-    if args.opw_mode != "capa_strict":
-        raise NotImplementedError(
-            f"Unsupported --opw-mode {args.opw_mode!r}. Only 'capa_strict' is implemented."
-        )
+    if args.no_update_summary and args.summary_path is not None:
+        raise ValueError("--no-update-summary cannot be combined with --summary")
 
     if args.require_gpu and not torch.cuda.is_available():
         raise RuntimeError("--require-gpu was set, but CUDA is unavailable.")
@@ -431,6 +430,17 @@ def main() -> int:
 
     input_dir = Path(args.input_dir)
     pred_dir = Path(args.pred_dir)
+    partial_audit, out_json, out_tsv, summary_path = _resolve_output_paths(
+        pred_dir,
+        args.scene_offset,
+        args.max_scenes,
+        args.out_json,
+        args.out_tsv,
+        args.summary_path,
+        args.no_update_summary,
+    )
+    if summary_path is not None and not summary_path.is_file():
+        raise FileNotFoundError(f"summary.json not found: {summary_path}")
     if args.scene_offset or args.max_scenes is not None:
         pairs = _collect_pairs_from_input_slice(
             input_dir,
@@ -442,22 +452,16 @@ def main() -> int:
         pairs = _collect_pairs(input_dir, pred_dir)
 
     fb_consistency = bool(args.fb_consistency)
-    if args.fb_consistency and args.no_fb_consistency:
-        raise ValueError("--fb-consistency and deprecated --no-fb-consistency cannot both be set.")
     print(f"fb_consistency: {str(fb_consistency).lower()}")
 
     try:
-        flow_model = load_gmflow(
-            args.gmflow_ckpt,
-            device,
-            gmflow_repo=args.gmflow_repo,
-        )
-    except ImportError as exc:
+        flow_model = load_gmflow(device=device)
+    except (ImportError, FileNotFoundError) as exc:
         print(f"ERROR: GMFlow unavailable: {exc}", file=sys.stderr)
         return 2
 
-    resolved_gmflow_repo = getattr(flow_model, "_capa_gmflow_repo", args.gmflow_repo)
-    resolved_gmflow_ckpt = getattr(flow_model, "_capa_gmflow_ckpt", args.gmflow_ckpt)
+    resolved_gmflow_repo = getattr(flow_model, "_capa_gmflow_repo", None)
+    resolved_gmflow_ckpt = getattr(flow_model, "_capa_gmflow_ckpt", None)
     print(f"gmflow_repo: {resolved_gmflow_repo}")
     print(f"gmflow_ckpt: {resolved_gmflow_ckpt}")
 
@@ -488,7 +492,6 @@ def main() -> int:
                 beta=args.beta,
                 fb_consistency=fb_consistency,
                 return_details=True,
-                opw_mode=args.opw_mode,
                 eval_mask=eval_mask,
                 flow_batch_size=args.flow_batch_size,
                 flow_max_side=args.flow_max_side,
@@ -502,7 +505,6 @@ def main() -> int:
                 flow_model=flow_model,
                 beta=args.beta,
                 fb_consistency=fb_consistency,
-                opw_mode=args.opw_mode,
                 eval_mask=eval_mask,
                 flow_batch_size=args.flow_batch_size,
                 flow_max_side=args.flow_max_side,
@@ -520,37 +522,41 @@ def main() -> int:
     mean_opw = sum(opw_values) / len(opw_values)
     print(f"mean\t{mean_opw:.6f}\t({len(opw_values)}/{len(opw_values)} scenes)")
 
-    if args.out_tsv:
-        _write_tsv(Path(args.out_tsv), scene_results)
+    _write_tsv(out_tsv, scene_results)
 
-    if args.out_json:
-        payload = {
-            "input_dir": str(input_dir),
-            "pred_dir": str(pred_dir),
-            "gmflow_ckpt": (
-                str(resolved_gmflow_ckpt) if resolved_gmflow_ckpt is not None else None
-            ),
-            "gmflow_repo": str(resolved_gmflow_repo) if resolved_gmflow_repo is not None else None,
-            "beta": float(args.beta),
-            "fb_consistency": bool(fb_consistency),
-            "opw_mode": args.opw_mode,
-            "depth_key": args.depth_key,
-            "eval_mask_key": args.eval_mask_key,
-            "flow_batch_size": args.flow_batch_size,
-            "flow_max_side": args.flow_max_side,
-            "per_scene_opw": [
-                {"scene": item["scene"], "opw": _json_number(item["opw"])}
-                for item in scene_results
-            ],
-            "mean_opw": _json_number(mean_opw),
-            "num_valid_scenes": len(opw_values),
-            "num_total_scenes": len(opw_values),
-        }
-        _write_json(Path(args.out_json), payload)
-        if args.update_summary is not None:
-            from scripts.merge_opw_summary import merge_summary
+    payload = {
+        "input_dir": str(input_dir),
+        "pred_dir": str(pred_dir),
+        "gmflow_ckpt": (
+            str(resolved_gmflow_ckpt) if resolved_gmflow_ckpt is not None else None
+        ),
+        "gmflow_repo": (
+            str(resolved_gmflow_repo) if resolved_gmflow_repo is not None else None
+        ),
+        "beta": float(args.beta),
+        "fb_consistency": bool(fb_consistency),
+        "protocol": OPW_PROTOCOL,
+        "depth_key": args.depth_key,
+        "eval_mask_key": args.eval_mask_key,
+        "flow_batch_size": args.flow_batch_size,
+        "flow_max_side": args.flow_max_side,
+        "per_scene_opw": [
+            {"scene": item["scene"], "opw": _json_number(item["opw"])}
+            for item in scene_results
+        ],
+        "mean_opw": _json_number(mean_opw),
+        "num_valid_scenes": len(opw_values),
+        "num_total_scenes": len(opw_values),
+    }
+    _write_json(out_json, payload)
+    print(f"opw_json: {out_json}")
+    print(f"opw_tsv: {out_tsv}")
+    if summary_path is not None:
+        from scripts.merge_opw_summary import merge_summary
 
-            merge_summary(args.update_summary, Path(args.out_json), None)
+        merge_summary(summary_path, out_json, None)
+    elif not partial_audit and not args.no_update_summary:
+        print(f"summary not found, audit kept without merge: {pred_dir / 'summary.json'}")
 
     return 0
 

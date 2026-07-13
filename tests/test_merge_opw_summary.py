@@ -46,6 +46,7 @@ def test_merge_opw_summary_updates_average_and_matching_scenes(tmp_path):
     assert merged["results"][1]["metrics"]["opw"] == 198.8
     assert merged["opw_evaluation"]["status"] == "computed_offline"
     assert merged["opw_evaluation"]["fb_consistency"] is True
+    assert merged["opw_evaluation"]["protocol"] == "capa_strict"
     assert "opw_audit" not in merged
     assert "NaN" not in summary_path.read_text(encoding="utf-8")
     assert len(list(tmp_path.glob("summary.json.before_opw_*"))) == 1
@@ -68,7 +69,7 @@ def test_merge_opw_summary_combines_disjoint_shards(tmp_path):
         ),
         encoding="utf-8",
     )
-    common = {"fb_consistency": True, "opw_mode": "capa_strict"}
+    common = {"fb_consistency": True, "protocol": "capa_strict"}
     shard_a.write_text(
         json.dumps(
             {
@@ -106,6 +107,7 @@ def test_merge_opw_summary_rejects_duplicate_scenes_across_shards(tmp_path):
     shard_b = tmp_path / "shard_b.json"
     summary_path.write_text(json.dumps({"avg_metrics": {}}), encoding="utf-8")
     payload = {
+        "protocol": "capa_strict",
         "per_scene_opw": [{"scene": "scene_000", "opw": 1.0}],
         "num_total_scenes": 1,
     }
@@ -144,6 +146,7 @@ def test_merge_opw_summary_requires_exact_scene_coverage(
     opw_path.write_text(
         json.dumps(
             {
+                "protocol": "capa_strict",
                 "mean_opw": sum(values) / len(values),
                 "per_scene_opw": [
                     {"scene": scene, "opw": value}
@@ -175,6 +178,7 @@ def test_merge_opw_summary_rejects_inconsistent_mean(tmp_path):
     opw_path.write_text(
         json.dumps(
             {
+                "protocol": "capa_strict",
                 "mean_opw": 2.0,
                 "per_scene_opw": [{"scene": "scene_000", "opw": 1.0}],
                 "num_valid_scenes": 1,
@@ -215,6 +219,7 @@ def test_merge_opw_summary_rejects_shard_protocol_mismatch(tmp_path):
     shard_a.write_text(
         json.dumps(
             {
+                "protocol": "capa_strict",
                 "fb_consistency": True,
                 "per_scene_opw": [{"scene": "scene_000", "opw": 1.0}],
                 "num_total_scenes": 1,
@@ -225,6 +230,7 @@ def test_merge_opw_summary_rejects_shard_protocol_mismatch(tmp_path):
     shard_b.write_text(
         json.dumps(
             {
+                "protocol": "capa_strict",
                 "per_scene_opw": [{"scene": "scene_001", "opw": 1.0}],
                 "num_total_scenes": 1,
             }

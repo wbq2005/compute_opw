@@ -1,28 +1,48 @@
 # OPW 复现协议
 
-更新日期：2026-07-12
+更新日期：2026-07-13
 
-本文档记录当前仓库中 OPW 的唯一推荐评测路径。目标是让预测、OPW
-计算和结果汇总彼此独立，并保证不完整结果不会被写成一次成功实验。
+本文记录仓库中唯一支持的 CAPA OPW 评测协议，以及可重复执行的命令。OPW 必须由代码计算并写入 `summary.json`，不得手工填写均值。
 
-## 1. 评测定义
+## 1. 固定定义
 
 - 实现入口：`capa/utils/metric.py::compute_opw()`
-- 协议模式：`capa_strict`
-- RGB 可见性权重：`beta=50`
+- 协议：`capa_strict`，代码不再提供其他 mode
+- RGB 可见性权重：论文给定的 `beta=50`
 - 评测区域：稠密 GT 中有限且大于 0 的像素
 - 光流：GMFlow Sintel checkpoint
-- 最终报告值：逐相邻帧对 OPW 的平均，再乘 100
-- Metropolis 最终复现设置：启用 forward-backward consistency，不缩放光流输入
+- 报告值：相邻帧对 OPW 的平均值乘 100
+- Metropolis 正式复现：启用 forward-backward consistency，不缩放光流输入
 
-论文没有完整给出“有效 backward-flow correspondence”的工程判定细节。
-因此 `fb_consistency` 必须作为协议元数据记录，不能在不同实验间静默切换。
+论文没有完整说明“有效 backward-flow correspondence”的工程判定，因此是否启用 forward-backward consistency 必须写入结果元数据，不能在实验之间静默切换。
 
-## 2. 推荐流程
+## 2. GMFlow 自动发现
 
-### 2.1 生成预测
+正常目录结构下不需要传 `--gmflow-repo` 或 `--gmflow-ckpt`。代码按以下顺序寻找 GMFlow：
 
-基线阶段不加载 GMFlow：
+1. 环境变量 `GMFLOW_REPO` / `GMFLOW_CKPT`（仅供非标准位置使用）
+2. `~/gmflow`
+3. 项目内 `third_party/gmflow` 或 `gmflow`
+
+标准权重文件放在 `<gmflow>/pretrained/models/gmflow_sintel-0c07dcb3.pth`。
+
+## 3. 推荐流程
+
+### 3.1 默认在线计算
+
+普通分辨率实验直接运行 `run.py`。OPW 默认开启，成功后 `summary.json` 同时包含 `avg_metrics.opw`、逐场景 OPW 和 `opw_evaluation` 元数据。
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python run.py \
+  --config config/vggt_baseline.yaml \
+  --input <dataset_dir> \
+  --output <prediction_dir> \
+  --save-pt
+```
+
+### 3.2 高分辨率离线计算
+
+VGGT 与 GMFlow 同时驻留可能导致显存不足。此时先显式跳过在线 OPW：
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 python run.py \
@@ -33,57 +53,42 @@ CUDA_VISIBLE_DEVICES=7 python run.py \
   --no-opw
 ```
 
-此时 `summary.json` 的 `avg_metrics` 不包含 `opw`，并记录：
-
-```json
-"opw_evaluation": {"status": "not_requested", "online": false}
-```
-
-### 2.2 离线计算并写回 OPW
-
-高分辨率视频采用分块光流，避免 VGGT 与 GMFlow 同时占用显存：
+预测完成后执行完整审计。脚本默认生成 `<prediction_dir>/opw.json`、`opw.tsv`，并自动备份和更新相邻的 `summary.json`：
 
 ```bash
-export GMFLOW_REPO=/home/tankh/gmflow
-export GMFLOW_CKPT=/home/tankh/gmflow/pretrained/models/gmflow_sintel-0c07dcb3.pth
-export PYTHONPATH="$GMFLOW_REPO:$PYTHONPATH"
-
 CUDA_VISIBLE_DEVICES=7 python -u scripts/audit_opw_metric.py \
-  --gmflow-ckpt "$GMFLOW_CKPT" \
-  --gmflow-repo "$GMFLOW_REPO" \
   --input-dir <dataset_dir> \
   --pred-dir <prediction_dir> \
   --flow-batch-size 2 \
-  --fb-consistency \
-  --out-json <prediction_dir>/opw_capa_strict_fb.json \
-  --out-tsv <prediction_dir>/opw_capa_strict_fb.tsv \
-  --update-summary <prediction_dir>/summary.json
+  --fb-consistency
 ```
 
-审计与合并必须满足：
+仅做单场景排错时可加 `--max-scenes 1`。probe 会写独立文件，且不会自动合并 summary。完整审计若不希望更新 summary，显式加 `--no-update-summary`。
 
-1. 输入、预测、OPW JSON 和 summary 的场景集合完全相同。
-2. 所有逐场景 OPW 都是有限数。
-3. JSON 中声明的均值等于逐场景均值。
-4. summary 使用标准 JSON，不允许 `NaN` 或 `Infinity`。
-5. 写回前自动备份原 summary，写回采用原子替换。
+## 4. Summary 写入约束
 
-## 3. 已确认的 Metropolis 8-line v3 结果
+完整审计在写回前必须满足：
+
+1. 输入、预测、OPW JSON 与 summary 的场景集合完全一致。
+2. 所有逐场景 OPW 均为有限数。
+3. JSON 声明的均值等于逐场景均值。
+4. 输出为标准 JSON，不允许 `NaN` 或 `Infinity`。
+5. 原 summary 自动备份，更新使用原子替换。
+
+历史审计文件中的 `opw_mode: capa_strict` 会在读取时兼容转换为 `protocol: capa_strict`；新文件只写 `protocol`。
+
+## 5. 已确认的 Metropolis 8-line v3 结果
 
 - 数据：`dataset/metropolis/metropolis_8line_noisy_v3`
 - 预测：`output/noise_probe/metropolis_8line_v3/vggt`
-- 正式汇总：`output/noise_probe/metropolis_8line_v3/vggt/summary.json`
-- OPW 审计：`output/noise_probe/metropolis_8line_v3/vggt/opw_capa_strict_fb.json`
-- 逐场景 OPW：`output/noise_probe/metropolis_8line_v3/vggt/opw_capa_strict_fb.tsv`
 - AbsRel：`0.100054`，即 `10.0054%`
 - OPW：`150.40766694810657`
 - 覆盖：`36/36` 场景
 - 论文 VGGT 参考：AbsRel `10.0%`，OPW `149.4`
 
-代码整理前后的 v3 数值完全一致。整理只改变失败语义、结果校验和 JSON
-写入方式，不改变 `compute_opw()` 的数值公式。
+本轮接口整理不改变 `compute_opw()` 的数值公式。
 
-## 4. 回归检查
+## 6. 回归检查
 
 ```bash
 python -m py_compile \
@@ -92,5 +97,3 @@ python -m py_compile \
 
 python -m pytest tests -q
 ```
-
-2026-07-12 第二轮严谨性审阅后的结果为 `49 passed`。
