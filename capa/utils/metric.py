@@ -1,5 +1,23 @@
 # Copyright (c) 2026 NVIDIA Corporation. All rights reserved.
 # Licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)
+"""CAPA metric implementations.
+
+Canonical offline OPW evaluation command, run from the repository root::
+
+    CUDA_VISIBLE_DEVICES=<gpu_id> python -u scripts/audit_opw_metric.py \
+      --input-dir <dataset_dir> \
+      --pred-dir <prediction_dir> \
+      --flow-batch-size <2_or_4> \
+      --fb-consistency
+
+Use flow batch size 4 for ScanNet/7-Scenes and 2 for high-resolution
+Metropolis clips. GMFlow and its checkpoint are discovered automatically. A
+complete audit writes ``opw.json``/``opw.tsv``, backs up the adjacent
+``summary.json``, and merges the audited OPW values into it. Commands using
+``--max-scenes`` or ``--scene-offset`` are probes and never auto-update the
+formal summary.
+"""
+
 import math
 import os
 import sys
