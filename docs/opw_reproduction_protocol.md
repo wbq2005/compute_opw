@@ -11,6 +11,7 @@
 - RGB 可见性权重：论文给定的 `beta=50`
 - 评测区域：稠密 GT 中有限且大于 0 的像素
 - 光流：GMFlow Sintel checkpoint
+- 有效对应：默认启用 forward-backward consistency
 - 报告值：相邻帧对 OPW 的平均值乘 100
 - Metropolis 正式复现：启用 forward-backward consistency，不缩放光流输入
 
@@ -59,11 +60,12 @@ CUDA_VISIBLE_DEVICES=7 python run.py \
 CUDA_VISIBLE_DEVICES=7 python -u scripts/audit_opw_metric.py \
   --input-dir <dataset_dir> \
   --pred-dir <prediction_dir> \
-  --flow-batch-size 2 \
-  --fb-consistency
+  --flow-batch-size 2
 ```
 
 仅做单场景排错时可加 `--max-scenes 1`。probe 会写独立文件，且不会自动合并 summary。完整审计若不希望更新 summary，显式加 `--no-update-summary`。
+
+FB consistency 默认开启。`--no-fb-consistency` 仅用于明确标注的消融实验，不用于正式表格复现。
 
 ## 4. Summary 写入约束
 

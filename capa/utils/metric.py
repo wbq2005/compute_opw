@@ -7,11 +7,12 @@ Canonical offline OPW evaluation command, run from the repository root::
     CUDA_VISIBLE_DEVICES=<gpu_id> python -u scripts/audit_opw_metric.py \
       --input-dir <dataset_dir> \
       --pred-dir <prediction_dir> \
-      --flow-batch-size <2_or_4> \
-      --fb-consistency
+      --flow-batch-size <2_or_4>
 
 Use flow batch size 4 for ScanNet/7-Scenes and 2 for high-resolution
 Metropolis clips. GMFlow and its checkpoint are discovered automatically. A
+forward/backward consistency check is enabled by default; use
+``--no-fb-consistency`` only for an explicitly labelled ablation. A
 complete audit writes ``opw.json``/``opw.tsv``, backs up the adjacent
 ``summary.json``, and merges the audited OPW values into it. Commands using
 ``--max-scenes`` or ``--scene-offset`` are probes and never auto-update the
@@ -32,6 +33,7 @@ from .logging import get_local_logger
 logger = get_local_logger(__name__)
 
 OPW_PROTOCOL = "capa_strict"
+DEFAULT_FB_CONSISTENCY = True
 
 _GMFLOW_HELP = (
     "GMFlow is required for real OPW evaluation but could not be imported. "
@@ -511,7 +513,7 @@ def compute_opw(
     rgb: torch.Tensor,
     flow_model: Any | None = None,
     beta: float = 50.0,
-    fb_consistency: bool = False,
+    fb_consistency: bool = DEFAULT_FB_CONSISTENCY,
     return_details: bool = False,
     eval_mask: torch.Tensor | None = None,
     flow_batch_size: int | None = None,
@@ -531,8 +533,8 @@ def compute_opw(
             For each adjacent pair, OPW calls it as ``flow_model(I[t+1], I[t])``
             to obtain the backward flow ``F_{t+1=>t}``.
         beta: visibility-weight coefficient.  CAPA uses 50.
-        fb_consistency: optional additional forward/backward consistency filter.
-            Disabled by default because it is not part of CAPA strict OPW.
+        fb_consistency: forward/backward consistency filter. Enabled by default
+            for the canonical CAPA evaluation protocol.
         return_details: if true, return ``(opw, details)``.  ``details`` contains
             reported-scale per-pair OPW values (also multiplied by 100),
             denominator valid counts, weight sums, beta, protocol, and whether

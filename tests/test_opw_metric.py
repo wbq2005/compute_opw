@@ -4,7 +4,11 @@ import pytest
 import torch
 
 import capa.utils.metric as metric
-from capa.utils.metric import bilinear_warp_by_backward_flow, compute_opw
+from capa.utils.metric import (
+    DEFAULT_FB_CONSISTENCY,
+    bilinear_warp_by_backward_flow,
+    compute_opw,
+)
 from capa.utils.metric import _forward_backward_consistency_mask, _run_flow_model
 
 
@@ -170,8 +174,15 @@ def test_compute_opw_flow_chunking_preserves_metric():
         flow_model,
         eval_mask=eval_mask,
         flow_batch_size=2,
+        fb_consistency=False,
     )
-    unchunked = compute_opw(depth, rgb, FakeFlowModel(), eval_mask=eval_mask)
+    unchunked = compute_opw(
+        depth,
+        rgb,
+        FakeFlowModel(),
+        eval_mask=eval_mask,
+        fb_consistency=False,
+    )
 
     assert flow_model.batch_sizes == [2, 2, 1]
     assert chunked == pytest.approx(unchunked, abs=1e-6)
@@ -238,6 +249,7 @@ def test_compute_opw_uses_target_to_source_backward_flow():
         rgb,
         RightSamplingFlowModel(),
         eval_mask=eval_mask,
+        fb_consistency=False,
     )
 
     assert opw == pytest.approx(0.0, abs=1e-6)
@@ -248,10 +260,11 @@ def test_compute_opw_details_include_formula_validity_counts():
     depth = torch.ones(2, H, W)
     rgb = torch.zeros(2, 3, H, W)
 
+    flow_model = BatchRecordingFlowModel()
     opw, details = compute_opw(
         depth,
         rgb,
-        FakeFlowModel(),
+        flow_model,
         eval_mask=all_pixels(depth),
         return_details=True,
     )
@@ -263,6 +276,9 @@ def test_compute_opw_details_include_formula_validity_counts():
     assert details["invalid_correspondence_count"].tolist() == [0]
     assert details["invalid_warped_depth_count"].tolist() == [0]
     assert details["protocol"] == "capa_strict"
+    assert DEFAULT_FB_CONSISTENCY is True
+    assert details["fb_consistency"] is True
+    assert flow_model.batch_sizes == [1, 1]
 
 
 def test_compute_opw_uses_dense_gt_mask_for_omega():

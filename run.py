@@ -35,6 +35,7 @@ from tqdm import tqdm
 from capa import CAPAProtocol
 from capa.utils.logging import get_local_logger
 from capa.utils.metric import (
+    DEFAULT_FB_CONSISTENCY,
     OPW_PROTOCOL,
     average_metrics,
     compute_depth_metrics,
@@ -261,7 +262,7 @@ def process_samples(
     result_file: Path | None = None,
     online_opw: bool = False,
     opw_beta: float = 50.0,
-    opw_fb_consistency: bool = False,
+    opw_fb_consistency: bool = DEFAULT_FB_CONSISTENCY,
     opw_flow_batch_size: int | None = None,
     opw_flow_max_side: int | None = None,
     save_trace: bool = False,
@@ -542,7 +543,7 @@ def _worker_fn(
     tmp_dir: Path,
     online_opw: bool = False,
     opw_beta: float = 50.0,
-    opw_fb_consistency: bool = False,
+    opw_fb_consistency: bool = DEFAULT_FB_CONSISTENCY,
     opw_flow_batch_size: int | None = None,
     opw_flow_max_side: int | None = None,
     save_trace: bool = False,
@@ -596,11 +597,20 @@ def main():
             "offline audit afterwards; summary omits OPW until that audit merges."
         ),
     )
-    parser.add_argument(
+    opw_fb_group = parser.add_mutually_exclusive_group()
+    opw_fb_group.add_argument(
         "--opw-fb-consistency",
+        dest="opw_fb_consistency",
         action="store_true",
-        help="Enable forward-backward flow consistency filtering for online OPW.",
+        help="Enable forward-backward consistency for online OPW (default).",
     )
+    opw_fb_group.add_argument(
+        "--no-opw-fb-consistency",
+        dest="opw_fb_consistency",
+        action="store_false",
+        help="Disable online forward-backward consistency for an explicit ablation.",
+    )
+    parser.set_defaults(opw_fb_consistency=DEFAULT_FB_CONSISTENCY)
     parser.add_argument(
         "--opw-flow-batch-size",
         type=int,
@@ -646,7 +656,7 @@ def main():
 
     online_opw = not args.no_opw
     opw_options_used = (
-        args.opw_fb_consistency
+        args.opw_fb_consistency != DEFAULT_FB_CONSISTENCY
         or args.opw_flow_batch_size != 2
         or args.opw_flow_max_side is not None
     )

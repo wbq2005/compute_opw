@@ -150,10 +150,10 @@ bash scripts/run_zeroshot_vggt_baselines.sh
 - backward flow `F_{t+1=>t}`
 - `beta=50`
 - no depth normalization
-- `fb_consistency=false`
+- `fb_consistency=true`
 - reported value multiplied by `100`
 
-不要在复现 CAPA 表格默认结果时传 `--fb-consistency`。该选项只用于额外消融或调试。
+正式复现默认启用 forward-backward consistency；只有明确的消融实验才传 `--no-fb-consistency`。
 
 如果希望 baseline 结束后自动计算 OPW，打开 `COMPUTE_OPW=1`：
 
@@ -220,8 +220,8 @@ head output/tab1_zeroshot_vggt_baselines/7scenes_sfm/vggt/opw.tsv
 - `pred_dir`
 - `gmflow_ckpt`
 - `beta`
-- `fb_consistency`，默认应为 `false`
-- `opw_mode`
+- `fb_consistency`，默认应为 `true`
+- `protocol`，应为 `capa_strict`
 - `per_scene_opw`
 - `mean_opw`
 - `num_valid_scenes`
@@ -303,9 +303,9 @@ test -f "$GMFLOW_CKPT"
 
 先确认 `opw.json` 中：
 
-- `opw_mode` 是 `capa_strict`；
+- `protocol` 是 `capa_strict`；
 - `beta` 是 `50.0`；
-- `fb_consistency` 是 `false`，除非你明确在做 forward-backward consistency 消融；
+- `fb_consistency` 是 `true`；只有明确的消融实验才应为 `false`；
 - RGB 输入是 `[T,3,H,W]`；
 - depth 是 metric depth，未做 median/mean/MAD/min-max normalization；
 - 返回值已经乘以 100。

@@ -6,8 +6,7 @@ Recommended Metropolis invocation from the repository root::
     CUDA_VISIBLE_DEVICES=7 python -u scripts/audit_opw_metric.py \
       --input-dir dataset/metropolis/metropolis_8line_noisy_v3 \
       --pred-dir output/noise_probe/metropolis_8line_v3/vggt \
-      --flow-batch-size 2 \
-      --fb-consistency
+      --flow-batch-size 2
 
 GMFlow is discovered automatically. A full audit writes ``opw.json`` and
 ``opw.tsv`` under ``--pred-dir`` and updates the adjacent ``summary.json``.
@@ -29,7 +28,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from capa.utils.metric import OPW_PROTOCOL, compute_opw, load_gmflow
+from capa.utils.metric import (
+    DEFAULT_FB_CONSISTENCY,
+    OPW_PROTOCOL,
+    compute_opw,
+    load_gmflow,
+)
 from run import load_sample
 
 
@@ -332,14 +336,20 @@ def main() -> int:
             "and vector-scaled back to the original evaluation grid."
         ),
     )
-    parser.add_argument(
+    fb_group = parser.add_mutually_exclusive_group()
+    fb_group.add_argument(
         "--fb-consistency",
+        dest="fb_consistency",
         action="store_true",
-        help=(
-            "Enable optional forward-backward flow consistency filtering. "
-            "Disabled by default for formula-strict CAPA OPW."
-        ),
+        help="Enable forward-backward consistency filtering (default).",
     )
+    fb_group.add_argument(
+        "--no-fb-consistency",
+        dest="fb_consistency",
+        action="store_false",
+        help="Disable forward-backward consistency for an explicit ablation.",
+    )
+    parser.set_defaults(fb_consistency=DEFAULT_FB_CONSISTENCY)
     parser.add_argument(
         "--depth-key",
         default="depth_pred_nhw",
